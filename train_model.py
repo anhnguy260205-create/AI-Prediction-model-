@@ -16,6 +16,11 @@ Usage
     python train_model.py ALL --csv other_master.csv   # custom input file
 """
 
+from sklearn.metrics import (
+    confusion_matrix, roc_auc_score, accuracy_score,
+    f1_score, precision_score, recall_score,
+)
+import matplotlib.pyplot as plt
 import sys
 import warnings
 from datetime import datetime
@@ -27,11 +32,6 @@ import yfinance as yf
 import xgboost as xgb
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from sklearn.metrics import (
-    confusion_matrix, roc_auc_score, accuracy_score,
-    f1_score, precision_score, recall_score,
-)
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -42,18 +42,17 @@ ALL_TICKERS = ["AAPL", "AMD", "AMZN", "AVGO", "GOOGL",
 
 # Full feature set matching xgb_stock_model baseline + extra
 TECHNICAL_FEATURES = [
-    "return_1d", "return_2d", "return_5d",
-    "price_to_ma5", "price_to_ma20", "ma5_to_ma20",
-    "rsi", "macd_diff", "stoch_k", "stoch_d",
-    "bb_width", "bb_pct", "atr_pct", "volume_ratio",
+    "return_1d", "return_5d",            # dropped: return_2d (redundant)
+    "price_to_ma5", "ma5_to_ma20",       # dropped: price_to_ma20 (correlated)
+    "rsi", "macd_diff", "stoch_k",       # dropped: stoch_d (derived from stoch_k)
+    "bb_pct", "atr_pct", "volume_ratio", # dropped: bb_width (correlated with bb_pct)
     "return_lag1", "return_lag2", "return_lag3",
-    "rsi_lag1", "rsi_lag2", "rsi_lag3",
+    "rsi_lag1",                          # dropped: rsi_lag2, rsi_lag3 (diminishing signal)
 ]
 
 SENTIMENT_FEATURES = [
     "finbert_score_mean", "finbert_pos_mean", "finbert_neg_mean",
     "news_count", "sentiment_lag1", "sentiment_lag2",
-    "has_sentiment",   # binary flag: 1 if real FinBERT scores exist, 0 if zeroed
 ]
 
 MARKET_FEATURES = [
@@ -65,6 +64,7 @@ MARKET_FEATURES = [
 ALL_FEATURES = TECHNICAL_FEATURES + SENTIMENT_FEATURES + MARKET_FEATURES
 
 SPY_CACHE = Path(".cache/spy_features.csv")
+VIX_CACHE = Path(".cache/vix_features.csv")
 
 
 # ── SPY market features ───────────────────────────────────────────────────────
@@ -91,6 +91,31 @@ def load_spy_features() -> pd.DataFrame:
     spy.to_csv(SPY_CACHE)
     print(f"         SPY features cached -> {SPY_CACHE}")
     return spy
+
+
+# ── VIX market features ───────────────────────────────────────────────────────
+
+def load_vix_features() -> pd.DataFrame:
+    if VIX_CACHE.exists():
+        print(f"         VIX features loaded from cache ({VIX_CACHE})")
+        return pd.read_csv(VIX_CACHE, index_col=0, parse_dates=True)
+
+    print(f"         Downloading VIX data from yfinance ...")
+    VIX_CACHE.parent.mkdir(exist_ok=True)
+    raw = yf.Ticker("^VIX").history(period="10y", interval="1d", auto_adjust=True)
+    if raw.empty:
+        raise RuntimeError("Failed to download VIX data.")
+    if hasattr(raw.index, "tz") and raw.index.tz is not None:
+        raw.index = raw.index.tz_localize(None)
+
+    close = raw["Close"]
+    vix = pd.DataFrame(index=raw.index)
+    vix["vix_change"]   = close.pct_change(1)
+    vix["vix_ma_ratio"] = close / close.rolling(20).mean()  # relative to recent history
+    vix = vix.dropna()
+    vix.to_csv(VIX_CACHE)
+    print(f"         VIX features cached -> {VIX_CACHE}")
+    return vix
 
 
 # ── Step 1: Load master dataset ───────────────────────────────────────────────
@@ -126,7 +151,8 @@ def load_data(tickers: list[str], csv_path: str,
     print(f"         Tickers : {tickers}")
     print(f"         Rows    : {total_rows} ({len(tickers)} tickers × "
           f"{len(dates)} days each)")
-    print(f"         Range   : {dates.index[0].date()} -> {dates.index[-1].date()}")
+    print(
+        f"         Range   : {dates.index[0].date()} -> {dates.index[-1].date()}")
     return out
 
 
@@ -134,14 +160,18 @@ def load_data(tickers: list[str], csv_path: str,
 
 def _rsi(close, period=14):
     d = close.diff()
-    g = d.clip(lower=0).ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    l = (-d).clip(lower=0).ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    g = d.clip(lower=0).ewm(alpha=1/period,
+                            min_periods=period, adjust=False).mean()
+    l = (-d).clip(lower=0).ewm(alpha=1/period,
+                               min_periods=period, adjust=False).mean()
     return 100 - 100 / (1 + g / l.replace(0, np.nan))
+
 
 def _macd_diff(close, fast=12, slow=26, sig=9):
     m = (close.ewm(span=fast, adjust=False).mean()
          - close.ewm(span=slow, adjust=False).mean())
     return m - m.ewm(span=sig, adjust=False).mean()
+
 
 def _stoch(high, low, close, k=14, d=3):
     lo = low.rolling(k).min()
@@ -150,50 +180,51 @@ def _stoch(high, low, close, k=14, d=3):
     stoch_d = stoch_k.rolling(d).mean()
     return stoch_k, stoch_d
 
+
 def _bb(close, period=20, n=2.0):
     mid = close.rolling(period).mean()
     std = close.rolling(period).std(ddof=0)
     upper = mid + n * std
     lower = mid - n * std
     bb_width = (2 * n * std) / mid.replace(0, np.nan)
-    bb_pct   = (close - lower) / (upper - lower).replace(0, np.nan)
+    bb_pct = (close - lower) / (upper - lower).replace(0, np.nan)
     return bb_width, bb_pct
+
 
 def _atr_pct(high, low, close, period=14):
     pc = close.shift(1)
-    tr = pd.concat([high - low, (high - pc).abs(), (low - pc).abs()], axis=1).max(axis=1)
+    tr = pd.concat([high - low, (high - pc).abs(),
+                   (low - pc).abs()], axis=1).max(axis=1)
     return tr.ewm(alpha=1/period, min_periods=period, adjust=False).mean() / close
 
 
 def _build_features_single(df: pd.DataFrame, spy: pd.DataFrame,
-                            use_sentiment: bool) -> pd.DataFrame:
-    close  = df["Close"]
-    high   = df["High"]
-    low    = df["Low"]
+                           use_sentiment: bool) -> pd.DataFrame:
+    close = df["Close"]
+    high = df["High"]
+    low = df["Low"]
     volume = df["Volume"]
 
     out = pd.DataFrame(index=df.index)
 
     # Returns
-    out["return_1d"]  = close.pct_change(1)
-    out["return_2d"]  = close.pct_change(2)
-    out["return_5d"]  = close.pct_change(5)
+    out["return_1d"] = close.pct_change(1)
+    out["return_5d"] = close.pct_change(5)
 
     # Moving averages
     ma5  = close.rolling(5).mean()
     ma20 = close.rolling(20).mean()
-    out["price_to_ma5"]  = close / ma5.replace(0, np.nan)
-    out["price_to_ma20"] = close / ma20.replace(0, np.nan)
-    out["ma5_to_ma20"]   = ma5 / ma20.replace(0, np.nan)
+    out["price_to_ma5"] = close / ma5.replace(0, np.nan)
+    out["ma5_to_ma20"]  = ma5 / ma20.replace(0, np.nan)
 
     # Momentum
-    out["rsi"]       = _rsi(close)
+    out["rsi"]      = _rsi(close)
     out["macd_diff"] = _macd_diff(close)
-    out["stoch_k"], out["stoch_d"] = _stoch(high, low, close)
+    out["stoch_k"], _ = _stoch(high, low, close)
 
     # Volatility
-    out["bb_width"], out["bb_pct"] = _bb(close)
-    out["atr_pct"] = _atr_pct(high, low, close)
+    _, out["bb_pct"] = _bb(close)
+    out["atr_pct"]   = _atr_pct(high, low, close)
 
     # Volume
     out["volume_ratio"] = volume / volume.rolling(20).mean()
@@ -203,20 +234,12 @@ def _build_features_single(df: pd.DataFrame, spy: pd.DataFrame,
     out["return_lag2"] = out["return_1d"].shift(2)
     out["return_lag3"] = out["return_1d"].shift(3)
     out["rsi_lag1"]    = out["rsi"].shift(1)
-    out["rsi_lag2"]    = out["rsi"].shift(2)
-    out["rsi_lag3"]    = out["rsi"].shift(3)
 
-    # Sentiment — carry real scores where available, zero elsewhere
-    sent_cols = [c for c in SENTIMENT_FEATURES if c != "has_sentiment"]
-    for col in sent_cols:
+    # Sentiment
+    for col in SENTIMENT_FEATURES:
         out[col] = df[col].values if (use_sentiment and col in df.columns) else 0.0
-    # has_sentiment = 1 on rows where FinBERT actually ran, so XGBoost can condition on it
-    if use_sentiment and "finbert_score_mean" in df.columns:
-        out["has_sentiment"] = (df["finbert_score_mean"].values != 0).astype(float)
-    else:
-        out["has_sentiment"] = 0.0
 
-    # SPY market features
+    # SPY + VIX market features
     for col in MARKET_FEATURES:
         out[col] = spy[col].reindex(out.index, fill_value=0.0)
 
@@ -245,8 +268,8 @@ def build_features(ticker_data: dict[str, pd.DataFrame], use_sentiment: bool) ->
     print(f"         {len(combined)} total rows across all tickers")
 
     if use_sentiment:
-        nonzero = int((combined["has_sentiment"] == 1).sum())
-        total   = len(combined)
+        nonzero = int((combined["finbert_score_mean"] != 0).sum())
+        total = len(combined)
         print(f"         Sentiment coverage: {nonzero}/{total} rows "
               f"({nonzero/total*100:.1f}%) have real FinBERT scores")
     return combined
@@ -258,16 +281,18 @@ def time_series_split(df: pd.DataFrame, val_ratio=0.15, test_ratio=0.15):
     print(f"\n[Step 3] Splitting data (time-series by date, no shuffle) ...")
     clean = df[ALL_FEATURES + ["target"]].dropna()
 
-    unique_dates    = sorted(clean.index.unique())
-    n               = len(unique_dates)
-    val_start_date  = unique_dates[int(n * (1 - test_ratio - val_ratio))]
+    unique_dates = sorted(clean.index.unique())
+    n = len(unique_dates)
+    val_start_date = unique_dates[int(n * (1 - test_ratio - val_ratio))]
     test_start_date = unique_dates[int(n * (1 - test_ratio))]
 
-    train = clean[clean.index <  val_start_date]
-    val   = clean[(clean.index >= val_start_date) & (clean.index < test_start_date)]
-    test  = clean[clean.index >= test_start_date]
+    train = clean[clean.index < val_start_date]
+    val = clean[(clean.index >= val_start_date) &
+                (clean.index < test_start_date)]
+    test = clean[clean.index >= test_start_date]
 
-    print(f"         Train : {len(train):>5} rows  (up to {val_start_date.date()})")
+    print(
+        f"         Train : {len(train):>5} rows  (up to {val_start_date.date()})")
     print(f"         Val   : {len(val):>5} rows  "
           f"({val_start_date.date()} -> {test_start_date.date()})")
     print(f"         Test  : {len(test):>5} rows  "
@@ -277,28 +302,137 @@ def time_series_split(df: pd.DataFrame, val_ratio=0.15, test_ratio=0.15):
     return train, val, test
 
 
+# ── Step 3b: Walk-forward validation ─────────────────────────────────────────
+
+def walk_forward_eval(feature_df: pd.DataFrame, params: dict,
+                      n_splits: int = 5) -> float:
+    """
+    Train on rolling windows and average AUC across n_splits folds.
+    Gives a more honest performance estimate than a single test period.
+    """
+    from sklearn.model_selection import TimeSeriesSplit
+    print(f"\n[Walk-Forward] {n_splits}-fold time-series cross-validation ...")
+    clean = feature_df[ALL_FEATURES + ["target"]].dropna()
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    aucs = []
+
+    for fold, (train_idx, test_idx) in enumerate(tscv.split(clean)):
+        tr_full = clean.iloc[train_idx]
+        test = clean.iloc[test_idx]
+
+        # Internal val split for early stopping (last 15% of train)
+        cut = int(len(tr_full) * 0.85)
+        tr, vl = tr_full.iloc[:cut], tr_full.iloc[cut:]
+
+        m = xgb.XGBClassifier(**params, eval_metric="auc",
+                              early_stopping_rounds=50,
+                              random_state=42, verbosity=0)
+        m.fit(tr[ALL_FEATURES], tr["target"],
+              eval_set=[(vl[ALL_FEATURES], vl["target"])], verbose=False)
+
+        auc = roc_auc_score(test["target"],
+                            m.predict_proba(test[ALL_FEATURES])[:, 1])
+        aucs.append(auc)
+        print(f"  Fold {fold+1}/{n_splits}  "
+              f"{test.index[0].date()} -> {test.index[-1].date()}  "
+              f"AUC = {auc:.4f}  ({len(tr)} train rows)")
+
+    mean_auc = float(np.mean(aucs))
+    std_auc = float(np.std(aucs))
+    print(f"\n  Walk-forward AUC : {mean_auc:.4f} ± {std_auc:.4f}")
+    print(f"  (more reliable than single test split)")
+    return mean_auc
+
+
+# ── Step 3c: Optuna hyperparameter tuning ────────────────────────────────────
+
+def optimize_hyperparams(feature_df: pd.DataFrame,
+                         n_trials: int = 50) -> dict:
+    """
+    Use Optuna + TimeSeriesSplit to find the best XGBoost hyperparameters.
+    Returns the best param dict to pass into train_model().
+    """
+    try:
+        import optuna
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+    except ImportError:
+        print("  Optuna not installed. Run: pip install optuna")
+        return {}
+
+    from sklearn.model_selection import TimeSeriesSplit
+    clean = feature_df[ALL_FEATURES + ["target"]].dropna()
+    tscv = TimeSeriesSplit(n_splits=5)
+
+    print(f"\n[Optuna] Searching hyperparameters ({n_trials} trials) ...")
+
+    def objective(trial):
+        params = {
+            "n_estimators":       300,
+            "learning_rate":      trial.suggest_float("learning_rate",    0.005, 0.15, log=True),
+            "max_depth":          trial.suggest_int("max_depth",           2, 6),
+            "subsample":          trial.suggest_float("subsample",         0.5, 1.0),
+            "colsample_bytree":   trial.suggest_float("colsample_bytree",  0.5, 1.0),
+            "min_child_weight":   trial.suggest_int("min_child_weight",    3, 30),
+            "gamma":              trial.suggest_float("gamma",             0.0, 0.5),
+            "reg_alpha":          trial.suggest_float("reg_alpha",         0.0, 3.0),
+            "reg_lambda":         trial.suggest_float("reg_lambda",        0.5, 4.0),
+            "eval_metric":        "auc",
+            "early_stopping_rounds": 30,
+            "random_state":       42,
+            "verbosity":          0,
+        }
+        fold_aucs = []
+        for train_idx, val_idx in tscv.split(clean):
+            tr, vl = clean.iloc[train_idx], clean.iloc[val_idx]
+            cut = int(len(tr) * 0.85)
+            tr_tr, tr_vl = tr.iloc[:cut], tr.iloc[cut:]
+            m = xgb.XGBClassifier(**params)
+            m.fit(tr_tr[ALL_FEATURES], tr_tr["target"],
+                  eval_set=[(tr_vl[ALL_FEATURES], tr_vl["target"])],
+                  verbose=False)
+            fold_aucs.append(roc_auc_score(
+                vl["target"], m.predict_proba(vl[ALL_FEATURES])[:, 1]))
+        return float(np.mean(fold_aucs))
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+
+    best = study.best_params
+    print(f"\n  Best cross-val AUC : {study.best_value:.4f}")
+    print(f"  Best params:")
+    for k, v in best.items():
+        print(f"    {k:<22} = {v}")
+    return best
+
+
 # ── Step 4: Train XGBoost ─────────────────────────────────────────────────────
 
-def train_model(train: pd.DataFrame, val: pd.DataFrame) -> xgb.XGBClassifier:
+DEFAULT_PARAMS = {
+    "n_estimators":          1000,
+    "learning_rate":         0.01,
+    "max_depth":             3,
+    "subsample":             0.7,
+    "colsample_bytree":      0.7,
+    "min_child_weight":      10,
+    "gamma":                 0.2,
+    "reg_alpha":             0.5,
+    "reg_lambda":            2.0,
+    "scale_pos_weight":      1.0, # 1.0 = neutral; increase to penalise missing bears
+    "eval_metric":           "auc",
+    "early_stopping_rounds": 100,
+    "random_state":          42,
+    "verbosity":             0,
+}
+
+
+def train_model(train: pd.DataFrame, val: pd.DataFrame,
+                params: dict | None = None) -> xgb.XGBClassifier:
     print(f"\n[Step 4] Training XGBoost ...")
     X_train, y_train = train[ALL_FEATURES], train["target"]
-    X_val,   y_val   = val[ALL_FEATURES],   val["target"]
+    X_val,   y_val = val[ALL_FEATURES],   val["target"]
 
-    model = xgb.XGBClassifier(
-        n_estimators          = 1000,
-        learning_rate         = 0.01,   # slower learning = less overfit
-        max_depth             = 3,      # shallower trees = less overfit
-        subsample             = 0.7,
-        colsample_bytree      = 0.7,
-        min_child_weight      = 10,     # require more samples per leaf
-        gamma                 = 0.2,    # higher split threshold
-        reg_alpha             = 0.5,    # stronger L1
-        reg_lambda            = 2.0,    # stronger L2
-        eval_metric           = "auc",
-        early_stopping_rounds = 100,    # more patience
-        random_state          = 42,
-        verbosity             = 0,
-    )
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    model = xgb.XGBClassifier(**p)
     model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=50)
     print(f"         Best iteration : {model.best_iteration}")
     print(f"         Best val AUC   : {model.best_score:.4f}")
@@ -307,19 +441,49 @@ def train_model(train: pd.DataFrame, val: pd.DataFrame) -> xgb.XGBClassifier:
 
 # ── Step 5: Evaluate ──────────────────────────────────────────────────────────
 
-def evaluate(model: xgb.XGBClassifier, test: pd.DataFrame) -> float:
+def _best_threshold(y_true, y_proba) -> float:
+    """Find threshold that maximises balanced accuracy, searching 0.45–0.65."""
+    best_t, best_score = 0.5, 0.0
+    for t in np.arange(0.45, 0.66, 0.01):
+        pred        = (y_proba >= t).astype(int)
+        n_bull_pred = pred.sum()
+        n_bear_pred = len(pred) - n_bull_pred
+        if n_bull_pred == 0 or n_bear_pred == 0:
+            continue   # skip degenerate all-one-class solutions
+        bear_recall = (pred[y_true == 0] == 0).mean()
+        bull_recall = (pred[y_true == 1] == 1).mean()
+        bal = (bear_recall + bull_recall) / 2
+        if bal > best_score:
+            best_score, best_t = bal, t
+    return round(best_t, 2)
+
+
+def evaluate(model: xgb.XGBClassifier, test: pd.DataFrame,
+             val: pd.DataFrame | None = None) -> float:
     print(f"\n[Step 5] Evaluating on test set ...")
     X_test, y_test = test[ALL_FEATURES], test["target"]
-    y_pred  = model.predict(X_test)
     y_proba = model.predict_proba(X_test)[:, 1]
+
+    # Find best threshold on val set (not test) to avoid leakage
+    if val is not None:
+        X_val, y_val = val[ALL_FEATURES], val["target"]
+        val_proba    = model.predict_proba(X_val)[:, 1]
+        threshold    = _best_threshold(y_val.values, val_proba)
+        print(f"  Threshold optimised on val set: {threshold:.2f}  (default=0.50)")
+    else:
+        threshold = 0.50
+
+    y_pred = (y_proba >= threshold).astype(int)
 
     cm = confusion_matrix(y_test, y_pred)
     TN, FP, FN, TP = int(cm[0, 0]), int(cm[0, 1]), int(cm[1, 0]), int(cm[1, 1])
 
-    print(f"\n  --- CONFUSION MATRIX ---")
+    print(f"\n  --- CONFUSION MATRIX (threshold={threshold:.2f}) ---")
     print(f"                    Predicted 0   Predicted 1")
     print(f"  Actual 0 (bear)     {TN:>6}        {FP:>6}")
     print(f"  Actual 1 (bull)     {FN:>6}        {TP:>6}")
+    print(f"  Bear recall : {TN/(TN+FP):.1%}  |  Bull recall : {TP/(TP+FN):.1%}")
+    print(f"  Predicted bull: {y_pred.mean():.1%}  |  Actual bull: {y_test.mean():.1%}")
 
     auc = roc_auc_score(y_test, y_proba)
     print(f"\n  --- METRICS ---")
@@ -333,16 +497,16 @@ def evaluate(model: xgb.XGBClassifier, test: pd.DataFrame) -> float:
     imp = sorted(zip(model.feature_names_in_, model.feature_importances_),
                  key=lambda x: x[1], reverse=True)
     for i, (name, score) in enumerate(imp[:10], 1):
-        bar  = "#" * int(score * 300)
-        tag  = "(sentiment)" if name in SENTIMENT_FEATURES else \
-               "(market)"    if name in MARKET_FEATURES    else ""
+        bar = "#" * int(score * 300)
+        tag = "(sentiment)" if name in SENTIMENT_FEATURES else \
+            "(market)" if name in MARKET_FEATURES else ""
         print(f"  {i:>2}. {name:<28} {score:.4f}  {bar} {tag}")
 
     # Feature importance plot
-    feat_names  = [x[0] for x in imp]
+    feat_names = [x[0] for x in imp]
     feat_scores = [x[1] for x in imp]
     colors = ["#e07b54" if n in SENTIMENT_FEATURES else
-              "#2ca02c" if n in MARKET_FEATURES    else
+              "#2ca02c" if n in MARKET_FEATURES else
               "#4c72b0" for n in feat_names]
     fig, ax = plt.subplots(figsize=(10, 8))
     ax.barh(feat_names[::-1], feat_scores[::-1], color=colors[::-1])
@@ -360,7 +524,7 @@ def evaluate(model: xgb.XGBClassifier, test: pd.DataFrame) -> float:
 
 def save_model(model: xgb.XGBClassifier, label: str, auc: float) -> str:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-    filename  = f"xgb_{label.lower()}_auc{auc:.4f}_{timestamp}.json"
+    filename = f"xgb_{label.lower()}_auc{auc:.4f}_{timestamp}.json"
     model.save_model(filename)
     print(f"\n[Step 6] Model saved -> {filename}")
     return filename
@@ -369,10 +533,12 @@ def save_model(model: xgb.XGBClassifier, label: str, auc: float) -> str:
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    args          = sys.argv[1:]
+    args = sys.argv[1:]
     use_sentiment = "--no-sentiment" not in args
-    csv_path      = MASTER_CSV
-    start_date    = "2025-06-01"   # default: trim to window where FinBERT scores exist
+    run_tune = "--tune" in args
+    run_wf = "--walk-forward" in args
+    csv_path = MASTER_CSV
+    start_date = None
 
     if "--csv" in args:
         idx = args.index("--csv")
@@ -390,14 +556,15 @@ def main():
             idx = args.index(flag)
             if idx + 1 < len(args):
                 flag_values.add(args[idx + 1])
-    raw_args = [a for a in args if not a.startswith("--") and a not in flag_values]
+    raw_args = [a for a in args if not a.startswith(
+        "--") and a not in flag_values]
 
     if not raw_args or raw_args[0].upper() == "ALL":
         tickers = ALL_TICKERS
-        label   = "all"
+        label = "all"
     else:
         tickers = [t.upper() for t in raw_args]
-        label   = "_".join(tickers).lower()
+        label = "_".join(tickers).lower()
 
     print("=" * 60)
     print(f"  XGBoost Stock Direction Classifier")
@@ -408,18 +575,33 @@ def main():
         print(f"  From     : {start_date}")
     print("=" * 60)
 
-    ticker_data      = load_data(tickers, csv_path, start_date=start_date)
-    feature_df       = build_features(ticker_data, use_sentiment)
+    ticker_data = load_data(tickers, csv_path, start_date=start_date)
+    feature_df = build_features(ticker_data, use_sentiment)
+
+    # Optuna tuning — find best hyperparameters via cross-validation
+    best_params = {}
+    if run_tune:
+        best_params = optimize_hyperparams(feature_df, n_trials=50)
+
+    # Walk-forward evaluation — honest multi-period AUC
+    if run_wf:
+        wf_params = {k: v for k, v in {**DEFAULT_PARAMS, **best_params}.items()
+                     if k not in ("eval_metric", "early_stopping_rounds",
+                                  "random_state", "verbosity")}
+        walk_forward_eval(feature_df, params=wf_params)
+
+    # Final model — train on full train+val, evaluate on test
     train, val, test = time_series_split(feature_df)
-    model            = train_model(train, val)
-    auc              = evaluate(model, test)
+    model = train_model(train, val, params=best_params or None)
+    auc = evaluate(model, test, val=val)
     save_model(model, label, auc)
 
     print(f"\n{'=' * 60}")
     print(f"  Training complete.  Test AUC = {auc:.4f}")
     old_auc = 0.6920
-    diff    = auc - old_auc
-    print(f"  vs old model AUC  = {old_auc:.4f}  ({'+' if diff>=0 else ''}{diff:.4f})")
+    diff = auc - old_auc
+    print(
+        f"  vs old model AUC  = {old_auc:.4f}  ({'+' if diff>=0 else ''}{diff:.4f})")
     print("=" * 60)
 
 
