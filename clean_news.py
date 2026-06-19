@@ -98,10 +98,11 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
     report("Duplicate (ticker, headline) removed", before, len(df))
 
     # ── 5. Remove cross-ticker duplicates (same headline, different tickers) ──
-    # These are generic market articles incorrectly tagged to multiple stocks.
+    # Keep the first occurrence per headline — macro news (Fed, CPI) legitimately
+    # appears for multiple tickers; dropping all copies loses real signal.
     before = len(df)
-    df = df.drop_duplicates(subset=["headline"], keep=False)
-    report("Cross-ticker duplicate headlines removed", before, len(df))
+    df = df.drop_duplicates(subset=["headline"], keep="first")
+    report("Cross-ticker duplicate headlines deduplicated (keep first)", before, len(df))
 
     # ── 6. Drop rows with headline too short to carry meaning ─────────────────
     before = len(df)

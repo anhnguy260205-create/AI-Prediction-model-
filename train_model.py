@@ -627,7 +627,7 @@ def evaluate(model: xgb.XGBClassifier, test: pd.DataFrame,
     colors = ["#e07b54" if n in SENTIMENT_FEATURES else
               "#2ca02c" if n in MARKET_FEATURES else
               "#4c72b0" for n in feat_names]
-    fig, ax = plt.subplots(figsize=(10, 8))
+    _, ax = plt.subplots(figsize=(10, 8))
     ax.barh(feat_names[::-1], feat_scores[::-1], color=colors[::-1])
     ax.set_xlabel("Feature Importance (weight)")
     ax.set_title("XGBoost Feature Importance\n"

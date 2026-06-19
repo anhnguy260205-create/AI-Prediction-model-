@@ -17,15 +17,23 @@ import sys
 import warnings
 import glob
 import os
+import ssl
+import urllib3
 from pathlib import Path
 from datetime import datetime, timedelta
 
+import requests
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import xgboost as xgb
 
 warnings.filterwarnings("ignore")
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+ssl._create_default_https_context = ssl._create_unverified_context
+
+_SESSION = requests.Session()
+_SESSION.verify = False
 
 ALL_TICKERS = ["AAPL", "AMD", "AMZN", "AVGO", "GOOGL",
                "META", "MSFT", "NVDA", "ORCL", "TSLA"]
@@ -166,7 +174,7 @@ def _build_all_features(df: pd.DataFrame, spy: pd.DataFrame,
 
 def _download(ticker: str, days: int) -> pd.DataFrame:
     start = (datetime.today() - timedelta(days=days)).strftime("%Y-%m-%d")
-    raw   = yf.Ticker(ticker).history(start=start, auto_adjust=True)
+    raw   = yf.Ticker(ticker, session=_SESSION).history(start=start, auto_adjust=True)
     if raw.empty:
         raise RuntimeError(f"No data returned for {ticker}")
     if hasattr(raw.index, "tz") and raw.index.tz:
@@ -175,10 +183,10 @@ def _download(ticker: str, days: int) -> pd.DataFrame:
 
 
 def _download_market(days: int):
-    spy_raw = yf.Ticker("SPY").history(
+    spy_raw = yf.Ticker("SPY", session=_SESSION).history(
         start=(datetime.today()-timedelta(days=days)).strftime("%Y-%m-%d"),
         auto_adjust=True)
-    vix_raw = yf.Ticker("^VIX").history(
+    vix_raw = yf.Ticker("^VIX", session=_SESSION).history(
         start=(datetime.today()-timedelta(days=days)).strftime("%Y-%m-%d"),
         auto_adjust=True)
     for raw in [spy_raw, vix_raw]:

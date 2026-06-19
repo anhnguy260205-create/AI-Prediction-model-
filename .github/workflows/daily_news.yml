@@ -1,0 +1,74 @@
+name: Daily News Collection
+
+on:
+  schedule:
+    - cron: '0 1 * * 1-5'   # 1:00 AM UTC = 8:00 AM Vietnam time, weekdays only
+  workflow_dispatch:          # allow manual trigger from GitHub UI
+
+jobs:
+  collect-news:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ── 1. Checkout repo ────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python ────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # ── 3. Install lightweight dependencies only ────────────
+      - name: Install dependencies
+        run: pip install requests pandas python-dotenv urllib3 --quiet
+
+      # ── 4. Restore per-month JSON cache ─────────────────────
+      - name: Restore news cache
+        uses: actions/cache@v4
+        with:
+          path: news_collected/
+          key: news-cache-${{ runner.os }}
+          restore-keys: news-cache-
+
+      # ── 5. Restore all_news_collected.csv ───────────────────
+      - name: Restore news CSV
+        uses: actions/cache@v4
+        with:
+          path: all_news_collected.csv
+          key: news-csv-${{ runner.os }}
+          restore-keys: news-csv-
+
+      # ── 6. Update END_DATE to today and collect ─────────────
+      - name: Collect latest headlines
+        env:
+          FINNHUB_API_KEY:   ${{ secrets.FINNHUB_API_KEY }}
+          ALPACA_API_KEY:    ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
+          AV_API_KEY:        ${{ secrets.AV_API_KEY }}
+          TIINGO_API_KEY:    ${{ secrets.TIINGO_API_KEY }}
+        run: |
+          TODAY=$(date +%Y-%m-%d)
+          echo "Setting END_DATE to $TODAY"
+          python -c "
+          import re
+          from pathlib import Path
+          p = Path('collect_news.py')
+          p.write_text(re.sub(r'END_DATE\s*=\s*\"[\d-]+\"', f'END_DATE    = \"$TODAY\"', p.read_text()))
+          "
+          python collect_news.py
+
+      # ── 7. Clean headlines ──────────────────────────────────
+      - name: Clean headlines
+        run: python clean_news.py
+
+      # ── 8. Commit all_news_collected_clean.csv back to repo ─
+      - name: Commit updated clean CSV
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add all_news_collected_clean.csv
+          git diff --staged --quiet || git commit -m "chore: daily news update $(date +%Y-%m-%d)"
+          git push

@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# Environment / secrets
+.env
+
+# Large data files (managed via GitHub Actions cache)
+all_news_collected.csv
+all_news_finbert.csv
+master_dataset.csv
+master_dataset_with_sentiment.csv
+news_collected/finbert_scores_cache.csv
+
+# Logs
+logs/
+
+# Model files (keep only the best one in git)
+xgb_all_auc*.json
+xgb_stock_model.json
+
+# Cache
+.cache/
+
+# Plots
+feature_importance.png
