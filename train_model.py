@@ -7,13 +7,18 @@ next-day price direction (up=1 / down=0).
 
 Usage
 -----
-    python train_model.py                              # AAPL only
-    python train_model.py TSLA                         # single ticker
-    python train_model.py ALL                          # all 10 tickers combined
-    python train_model.py AAPL TSLA NVDA               # specific tickers combined
-    python train_model.py ALL --no-sentiment           # technical + SPY only
-    python train_model.py ALL --start-date 2025-06-01  # trim to sentiment window
-    python train_model.py ALL --csv other_master.csv   # custom input file
+    python train_model.py                                          # AAPL only
+    python train_model.py TSLA                                     # single ticker
+    python train_model.py ALL                                      # all 10 tickers combined
+    python train_model.py AAPL TSLA NVDA                           # specific tickers combined
+    python train_model.py ALL --no-sentiment                       # technical + SPY only
+    python train_model.py ALL --start-date 2025-06-01             # trim to sentiment window
+    python train_model.py ALL --csv other_master.csv               # custom input file
+    python train_model.py ALL --tune                               # Optuna hyperparameter search
+    python train_model.py ALL --walk-forward                       # walk-forward cross-validation
+    python train_model.py ALL --finetune                           # fine-tune latest saved model
+    python train_model.py ALL --finetune --finetune-model xgb.json # fine-tune specific model
+    python train_model.py ALL --finetune --finetune-months 3       # fine-tune on last 3 months
 """
 
 from sklearn.metrics import (
@@ -59,6 +64,8 @@ MARKET_FEATURES = [
     "spy_return_1d",
     "spy_return_5d",
     "spy_ma_ratio",
+    "vix_change",
+    "vix_ma_ratio",
 ]
 
 ALL_FEATURES = TECHNICAL_FEATURES + SENTIMENT_FEATURES + MARKET_FEATURES
@@ -199,7 +206,7 @@ def _atr_pct(high, low, close, period=14):
 
 
 def _build_features_single(df: pd.DataFrame, spy: pd.DataFrame,
-                           use_sentiment: bool) -> pd.DataFrame:
+                           vix: pd.DataFrame, use_sentiment: bool) -> pd.DataFrame:
     close = df["Close"]
     high = df["High"]
     low = df["Low"]
@@ -240,8 +247,9 @@ def _build_features_single(df: pd.DataFrame, spy: pd.DataFrame,
         out[col] = df[col].values if (use_sentiment and col in df.columns) else 0.0
 
     # SPY + VIX market features
+    market = spy.join(vix, how="outer")
     for col in MARKET_FEATURES:
-        out[col] = spy[col].reindex(out.index, fill_value=0.0)
+        out[col] = market[col].reindex(out.index, fill_value=0.0)
 
     # Label
     out["target"] = (close.shift(-1) > close).astype(int)
@@ -251,10 +259,11 @@ def _build_features_single(df: pd.DataFrame, spy: pd.DataFrame,
 def build_features(ticker_data: dict[str, pd.DataFrame], use_sentiment: bool) -> pd.DataFrame:
     print(f"\n[Step 2] Engineering features for {len(ticker_data)} ticker(s) ...")
     spy = load_spy_features()
+    vix = load_vix_features()
 
     frames = []
     for ticker, df in ticker_data.items():
-        feat = _build_features_single(df, spy, use_sentiment)
+        feat = _build_features_single(df, spy, vix, use_sentiment)
         feat["ticker"] = ticker
         frames.append(feat)
 
@@ -263,7 +272,7 @@ def build_features(ticker_data: dict[str, pd.DataFrame], use_sentiment: bool) ->
     sentiment_status = "ON" if use_sentiment else "OFF (zeroed)"
     print(f"         {len(TECHNICAL_FEATURES)} technical + "
           f"{len(SENTIMENT_FEATURES)} sentiment + "
-          f"{len(MARKET_FEATURES)} market (SPY) features "
+          f"{len(MARKET_FEATURES)} market (SPY+VIX) features "
           f"(sentiment {sentiment_status})")
     print(f"         {len(combined)} total rows across all tickers")
 
@@ -439,6 +448,116 @@ def train_model(train: pd.DataFrame, val: pd.DataFrame,
     return model
 
 
+# ── Step 4b: Fine-tune existing model ────────────────────────────────────────
+
+def _optuna_finetune(X_ft, y_ft, X_val, y_val,
+                     base_model_path: str, n_trials: int = 30) -> dict:
+    """Use Optuna to find best hyperparameters for the fine-tuning step."""
+    try:
+        import optuna
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+    except ImportError:
+        print("  Optuna not installed — using defaults. Run: pip install optuna")
+        return {}
+
+    print(f"  [Optuna] Searching fine-tune hyperparameters ({n_trials} trials) ...")
+
+    def objective(trial):
+        params = {
+            "n_estimators":          200,
+            "learning_rate":         trial.suggest_float("learning_rate",  0.001, 0.02, log=True),
+            "max_depth":             trial.suggest_int("max_depth",         2, 5),
+            "subsample":             trial.suggest_float("subsample",       0.5, 1.0),
+            "colsample_bytree":      trial.suggest_float("colsample_bytree",0.5, 1.0),
+            "min_child_weight":      trial.suggest_int("min_child_weight",  3, 20),
+            "gamma":                 trial.suggest_float("gamma",           0.0, 0.5),
+            "reg_alpha":             trial.suggest_float("reg_alpha",       0.0, 3.0),
+            "reg_lambda":            trial.suggest_float("reg_lambda",      0.5, 4.0),
+            "eval_metric":           "auc",
+            "early_stopping_rounds": 20,
+            "random_state":          42,
+            "verbosity":             0,
+        }
+        m = xgb.XGBClassifier(**params)
+        m.fit(X_ft, y_ft,
+              eval_set=[(X_val, y_val)],
+              xgb_model=base_model_path,
+              verbose=False)
+        return m.best_score
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+
+    best = study.best_params
+    print(f"  [Optuna] Best fine-tune AUC : {study.best_value:.4f}")
+    for k, v in best.items():
+        print(f"    {k:<22} = {v}")
+    return best
+
+
+def finetune_model(base_model_path: str, train: pd.DataFrame, val: pd.DataFrame,
+                   months: int = 6, optimize: bool = False) -> xgb.XGBClassifier:
+    """
+    Continue training from a saved model on the most recent N months of data.
+    Pass optimize=True to run Optuna on the recent window before fine-tuning.
+    """
+    import glob, os
+    if base_model_path is None:
+        candidates = [f for f in glob.glob("xgb_*.json")
+                      if f != "xgb_stock_model.json"]
+        if not candidates:
+            raise FileNotFoundError("No saved model found. Train a model first.")
+        base_model_path = max(candidates, key=os.path.getmtime)
+
+    print(f"\n[Step 4b] Fine-tuning: {base_model_path}")
+
+    cutoff       = train.index.max() - pd.DateOffset(months=months)
+    recent       = train[train.index >= cutoff]
+    X_ft, y_ft   = recent[ALL_FEATURES], recent["target"]
+    X_val, y_val = val[ALL_FEATURES],    val["target"]
+
+    print(f"         Recent window : last {months} months  "
+          f"({recent.index.min().date()} -> {recent.index.max().date()})")
+    print(f"         Fine-tune rows: {len(recent)}")
+
+    # Optuna search on the recent window if requested
+    best_params = {}
+    if optimize:
+        best_params = _optuna_finetune(X_ft, y_ft, X_val, y_val,
+                                       base_model_path, n_trials=30)
+
+    neg, pos = int((y_ft == 0).sum()), int((y_ft == 1).sum())
+    ft_params = {
+        "n_estimators":          200,
+        "learning_rate":         0.005,
+        "max_depth":             3,
+        "subsample":             0.7,
+        "colsample_bytree":      0.7,
+        "min_child_weight":      5,
+        "gamma":                 0.2,
+        "reg_alpha":             0.5,
+        "reg_lambda":            2.0,
+        "scale_pos_weight":      neg / pos if pos > 0 else 1.0,
+        "eval_metric":           "auc",
+        "early_stopping_rounds": 30,
+        "random_state":          42,
+        "verbosity":             0,
+        **best_params,           # Optuna overrides defaults if run
+    }
+    print(f"         scale_pos_weight = {ft_params['scale_pos_weight']:.3f}  "
+          f"(bear={neg}, bull={pos})")
+
+    model = xgb.XGBClassifier(**ft_params)
+    model.fit(X_ft, y_ft,
+              eval_set=[(X_val, y_val)],
+              xgb_model=base_model_path,
+              verbose=20)
+
+    print(f"         Best iteration : {model.best_iteration}")
+    print(f"         Best val AUC   : {model.best_score:.4f}")
+    return model
+
+
 # ── Step 5: Evaluate ──────────────────────────────────────────────────────────
 
 def _best_threshold(y_true, y_proba) -> float:
@@ -534,11 +653,14 @@ def save_model(model: xgb.XGBClassifier, label: str, auc: float) -> str:
 
 def main():
     args = sys.argv[1:]
-    use_sentiment = "--no-sentiment" not in args
-    run_tune = "--tune" in args
-    run_wf = "--walk-forward" in args
-    csv_path = MASTER_CSV
-    start_date = None
+    use_sentiment   = "--no-sentiment" not in args
+    run_tune        = "--tune" in args
+    run_wf          = "--walk-forward" in args
+    run_finetune    = "--finetune" in args
+    csv_path        = MASTER_CSV
+    start_date      = None
+    finetune_model_path  = None
+    finetune_months = 6
 
     if "--csv" in args:
         idx = args.index("--csv")
@@ -548,10 +670,18 @@ def main():
         idx = args.index("--start-date")
         if idx + 1 < len(args):
             start_date = args[idx + 1]
+    if "--finetune-model" in args:
+        idx = args.index("--finetune-model")
+        if idx + 1 < len(args):
+            finetune_model_path = args[idx + 1]
+    if "--finetune-months" in args:
+        idx = args.index("--finetune-months")
+        if idx + 1 < len(args):
+            finetune_months = int(args[idx + 1])
 
     # Collect ticker args (anything not starting with -- and not a flag value)
     flag_values = set()
-    for flag in ["--csv", "--start-date"]:
+    for flag in ["--csv", "--start-date", "--finetune-model", "--finetune-months"]:
         if flag in args:
             idx = args.index(flag)
             if idx + 1 < len(args):
@@ -592,7 +722,13 @@ def main():
 
     # Final model — train on full train+val, evaluate on test
     train, val, test = time_series_split(feature_df)
-    model = train_model(train, val, params=best_params or None)
+
+    if run_finetune:
+        model = finetune_model(finetune_model_path, train, val,
+                               months=finetune_months, optimize=run_tune)
+    else:
+        model = train_model(train, val, params=best_params or None)
+
     auc = evaluate(model, test, val=val)
     save_model(model, label, auc)
 

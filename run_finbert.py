@@ -1,14 +1,14 @@
 """
 FinBERT Sentiment Scorer
 ========================
-Reads headlines from all_news_collected.csv,
+Reads headlines from all_news_collected_clean.csv,
 scores each one with ProsusAI/finbert,
 aggregates per (date, ticker), and
 merges the result into master_dataset.csv.
 
 Usage
 -----
-    python run_finbert.py                        # uses all_news_collected.csv
+    python run_finbert.py                        # uses all_news_collected_clean.csv
     python run_finbert.py all_news_combined.csv  # use existing file
 """
 
@@ -19,7 +19,7 @@ import pandas as pd
 from pathlib import Path
 from transformers import pipeline
 
-INPUT_NEWS   = sys.argv[1] if len(sys.argv) > 1 else "all_news_collected.csv"
+INPUT_NEWS   = sys.argv[1] if len(sys.argv) > 1 else "all_news_collected_clean.csv"
 MASTER       = "master_dataset.csv"
 OUTPUT_NEWS  = "all_news_finbert.csv"
 OUTPUT_MASTER = "master_dataset_with_sentiment.csv"
