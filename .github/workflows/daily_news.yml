@@ -72,7 +72,17 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git pull --rebase origin main
+
           git add all_news_collected_clean.csv collect_news.py
-          git diff --staged --quiet || git commit -m "chore: daily news update $(date +%Y-%m-%d)"
-          git push origin main
+          git diff --staged --quiet && echo "Nothing to commit." && exit 0
+          git commit -m "chore: daily news update $(date +%Y-%m-%d)"
+
+          # Retry push up to 5 times — handles race with local machine pushes
+          for i in 1 2 3 4 5; do
+            echo "Push attempt $i..."
+            git push origin main && echo "Push succeeded." && exit 0
+            echo "Push failed — pulling and rebasing before retry..."
+            git pull --rebase origin main
+            sleep 3
+          done
+          echo "All push attempts failed." && exit 1
