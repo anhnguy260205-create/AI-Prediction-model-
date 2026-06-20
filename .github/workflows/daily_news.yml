@@ -69,23 +69,9 @@ jobs:
 
       # ── 8. Commit all_news_collected_clean.csv back to repo ─
       - name: Commit updated clean CSV
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          git add all_news_collected_clean.csv collect_news.py
-          git diff --staged --quiet && echo "Nothing to commit." && exit 0
-          git commit -m "chore: daily news update $(date +%Y-%m-%d)"
-
-          # Retry push up to 5 times (set -e safe: use if/then not &&)
-          for i in 1 2 3 4 5; do
-            echo "Push attempt $i..."
-            if git push origin main; then
-              echo "Push succeeded."
-              exit 0
-            fi
-            echo "Push failed — syncing with remote before retry..."
-            git pull --rebase origin main
-            sleep 3
-          done
-          echo "All 5 push attempts failed." && exit 1
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: daily news update"
+          file_pattern: "all_news_collected_clean.csv collect_news.py"
+          commit_user_name: "github-actions[bot]"
+          commit_user_email: "github-actions[bot]@users.noreply.github.com"
