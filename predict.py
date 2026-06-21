@@ -125,7 +125,8 @@ def _build_all_features(df: pd.DataFrame, spy: pd.DataFrame,
     sk, sd = _stoch(high, low, close)
     rsi_s  = _rsi(close)
 
-    out["return_1d"]   = close.pct_change(1)
+    daily_ret = close.pct_change(1)
+    out["return_1d"]   = daily_ret
     out["return_5d"]   = close.pct_change(5)
     out["return_10d"]  = close.pct_change(10)
     out["return_20d"]  = close.pct_change(20)
@@ -140,9 +141,12 @@ def _build_all_features(df: pd.DataFrame, spy: pd.DataFrame,
     out["bb_pct"]    = bb_p
     out["atr_pct"]   = _atr_pct(high, low, close)
     out["volume_ratio"] = volume / volume.rolling(20).mean()
-    out["return_lag1"]  = out["return_1d"].shift(1)
-    out["return_lag2"]  = out["return_1d"].shift(2)
-    out["return_lag3"]  = out["return_1d"].shift(3)
+    short_vol = daily_ret.rolling(10).std()
+    long_vol  = daily_ret.rolling(30).std()
+    out["vol_ratio"]    = short_vol / long_vol.replace(0, np.nan)
+    out["return_lag1"]  = daily_ret.shift(1)
+    out["return_lag2"]  = daily_ret.shift(2)
+    out["return_lag3"]  = daily_ret.shift(3)
     out["rsi_lag1"]  = rsi_s.shift(1)
     out["rsi_lag2"]  = rsi_s.shift(2)
     out["rsi_lag3"]  = rsi_s.shift(3)
@@ -208,12 +212,15 @@ def _download_market(days: int):
 
 # ── Find latest model ─────────────────────────────────────────────────────────
 
-def _find_latest_model() -> str:
-    models = glob.glob("xgb_*.json")
-    models = [m for m in models if m != "xgb_stock_model.json"]
+def _find_best_model() -> str:
+    import re
+    models = [m for m in glob.glob("xgb_*.json") if m != "xgb_stock_model.json"]
     if not models:
         raise FileNotFoundError("No xgb_*.json model files found. Run train_model.py first.")
-    return max(models, key=os.path.getmtime)
+    def _auc_from_name(path):
+        m = re.search(r"auc([\d.]+)", path)
+        return float(m.group(1)) if m else 0.0
+    return max(models, key=_auc_from_name)
 
 
 # ── Predict ───────────────────────────────────────────────────────────────────
@@ -269,7 +276,7 @@ def main():
         tickers = [t.upper() for t in args]
 
     if model_file is None:
-        model_file = _find_latest_model()
+        model_file = _find_best_model()
 
     print("=" * 55)
     print(f"  Stock Direction Predictor")

@@ -73,12 +73,15 @@ def update_collect_news_end_date():
 
 
 def find_best_model() -> str:
-    import glob
+    import glob, re
     models = [m for m in glob.glob(str(PROJECT_DIR / "xgb_*.json"))
               if "xgb_stock_model.json" not in m]
     if not models:
         return ""
-    return max(models, key=os.path.getmtime)
+    def _auc(path):
+        m = re.search(r"auc([\d.]+)", path)
+        return float(m.group(1)) if m else 0.0
+    return max(models, key=_auc)
 
 
 def main():

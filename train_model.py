@@ -27,6 +27,7 @@ from sklearn.metrics import (
 )
 import matplotlib.pyplot as plt
 import sys
+import time
 import warnings
 from datetime import datetime
 from pathlib import Path
@@ -47,12 +48,13 @@ ALL_TICKERS = ["AAPL", "AMD", "AMZN", "AVGO", "GOOGL",
 
 # Full feature set matching xgb_stock_model baseline + extra
 TECHNICAL_FEATURES = [
-    "return_1d", "return_5d",            # dropped: return_2d (redundant)
-    "price_to_ma5", "ma5_to_ma20",       # dropped: price_to_ma20 (correlated)
-    "rsi", "macd_diff", "stoch_k",       # dropped: stoch_d (derived from stoch_k)
-    "bb_pct", "atr_pct", "volume_ratio", # dropped: bb_width (correlated with bb_pct)
+    "return_1d", "return_5d", "return_20d",  # short / medium momentum
+    "price_to_ma5", "ma5_to_ma20",
+    "rsi", "macd_diff", "stoch_k",
+    "bb_pct", "atr_pct", "volume_ratio",
+    "vol_ratio",                             # short-vol / long-vol regime indicator
     "return_lag1", "return_lag2", "return_lag3",
-    "rsi_lag1",                          # dropped: rsi_lag2, rsi_lag3 (diminishing signal)
+    "rsi_lag1",
 ]
 
 SENTIMENT_FEATURES = [
@@ -64,6 +66,7 @@ MARKET_FEATURES = [
     "spy_return_1d",
     "spy_return_5d",
     "spy_ma_ratio",
+    "vix_level",    # absolute fear gauge
     "vix_change",
     "vix_ma_ratio",
 ]
@@ -72,57 +75,85 @@ ALL_FEATURES = TECHNICAL_FEATURES + SENTIMENT_FEATURES + MARKET_FEATURES
 
 SPY_CACHE = Path(".cache/spy_features.csv")
 VIX_CACHE = Path(".cache/vix_features.csv")
+_CACHE_MAX_AGE_HOURS = 23   # refresh cache if older than this
+
+
+def _cache_stale(path: Path, required_cols: list[str] | None = None) -> bool:
+    if not path.exists():
+        return True
+    if time.time() - path.stat().st_mtime > _CACHE_MAX_AGE_HOURS * 3600:
+        return True
+    if required_cols:
+        header = pd.read_csv(path, nrows=0).columns.tolist()
+        if any(c not in header for c in required_cols):
+            return True   # schema changed — regenerate
+    return False
 
 
 # ── SPY market features ───────────────────────────────────────────────────────
 
+_SPY_COLS = ["spy_return_1d", "spy_return_5d", "spy_ma_ratio"]
+_VIX_COLS = ["vix_level", "vix_change", "vix_ma_ratio"]
+
+
 def load_spy_features() -> pd.DataFrame:
-    if SPY_CACHE.exists():
+    if not _cache_stale(SPY_CACHE, required_cols=_SPY_COLS):
         print(f"         SPY features loaded from cache ({SPY_CACHE})")
         return pd.read_csv(SPY_CACHE, index_col=0, parse_dates=True)
 
     print(f"         Downloading SPY data from yfinance ...")
     SPY_CACHE.parent.mkdir(exist_ok=True)
-    raw = yf.Ticker("SPY").history(period="10y", interval="1d", auto_adjust=True)
-    if raw.empty:
-        raise RuntimeError("Failed to download SPY data.")
-    if hasattr(raw.index, "tz") and raw.index.tz is not None:
-        raw.index = raw.index.tz_localize(None)
-
-    close = raw["Close"]
-    spy = pd.DataFrame(index=raw.index)
-    spy["spy_return_1d"] = close.pct_change(1)
-    spy["spy_return_5d"] = close.pct_change(5)
-    spy["spy_ma_ratio"]  = close / close.rolling(20).mean()
-    spy = spy.dropna()
-    spy.to_csv(SPY_CACHE)
-    print(f"         SPY features cached -> {SPY_CACHE}")
-    return spy
+    try:
+        raw = yf.Ticker("SPY").history(period="10y", interval="1d", auto_adjust=True)
+        if raw.empty:
+            raise RuntimeError("Empty response")
+        if hasattr(raw.index, "tz") and raw.index.tz is not None:
+            raw.index = raw.index.tz_localize(None)
+        close = raw["Close"]
+        spy = pd.DataFrame(index=raw.index)
+        spy["spy_return_1d"] = close.pct_change(1)
+        spy["spy_return_5d"] = close.pct_change(5)
+        spy["spy_ma_ratio"]  = close / close.rolling(20).mean()
+        spy = spy.dropna()
+        spy.to_csv(SPY_CACHE)
+        print(f"         SPY features cached -> {SPY_CACHE}")
+        return spy
+    except Exception as e:
+        if SPY_CACHE.exists():
+            print(f"         WARNING: SPY download failed ({e}) — using stale cache")
+            return pd.read_csv(SPY_CACHE, index_col=0, parse_dates=True)
+        raise RuntimeError(f"Failed to download SPY data and no cache exists: {e}")
 
 
 # ── VIX market features ───────────────────────────────────────────────────────
 
 def load_vix_features() -> pd.DataFrame:
-    if VIX_CACHE.exists():
+    if not _cache_stale(VIX_CACHE, required_cols=_VIX_COLS):
         print(f"         VIX features loaded from cache ({VIX_CACHE})")
         return pd.read_csv(VIX_CACHE, index_col=0, parse_dates=True)
 
     print(f"         Downloading VIX data from yfinance ...")
     VIX_CACHE.parent.mkdir(exist_ok=True)
-    raw = yf.Ticker("^VIX").history(period="10y", interval="1d", auto_adjust=True)
-    if raw.empty:
-        raise RuntimeError("Failed to download VIX data.")
-    if hasattr(raw.index, "tz") and raw.index.tz is not None:
-        raw.index = raw.index.tz_localize(None)
-
-    close = raw["Close"]
-    vix = pd.DataFrame(index=raw.index)
-    vix["vix_change"]   = close.pct_change(1)
-    vix["vix_ma_ratio"] = close / close.rolling(20).mean()  # relative to recent history
-    vix = vix.dropna()
-    vix.to_csv(VIX_CACHE)
-    print(f"         VIX features cached -> {VIX_CACHE}")
-    return vix
+    try:
+        raw = yf.Ticker("^VIX").history(period="10y", interval="1d", auto_adjust=True)
+        if raw.empty:
+            raise RuntimeError("Empty response")
+        if hasattr(raw.index, "tz") and raw.index.tz is not None:
+            raw.index = raw.index.tz_localize(None)
+        close = raw["Close"]
+        vix = pd.DataFrame(index=raw.index)
+        vix["vix_level"]    = close
+        vix["vix_change"]   = close.pct_change(1)
+        vix["vix_ma_ratio"] = close / close.rolling(20).mean()
+        vix = vix.dropna()
+        vix.to_csv(VIX_CACHE)
+        print(f"         VIX features cached -> {VIX_CACHE}")
+        return vix
+    except Exception as e:
+        if VIX_CACHE.exists():
+            print(f"         WARNING: VIX download failed ({e}) — using stale cache")
+            return pd.read_csv(VIX_CACHE, index_col=0, parse_dates=True)
+        raise RuntimeError(f"Failed to download VIX data and no cache exists: {e}")
 
 
 # ── Step 1: Load master dataset ───────────────────────────────────────────────
@@ -215,8 +246,10 @@ def _build_features_single(df: pd.DataFrame, spy: pd.DataFrame,
     out = pd.DataFrame(index=df.index)
 
     # Returns
-    out["return_1d"] = close.pct_change(1)
-    out["return_5d"] = close.pct_change(5)
+    daily_ret = close.pct_change(1)
+    out["return_1d"]  = daily_ret
+    out["return_5d"]  = close.pct_change(5)
+    out["return_20d"] = close.pct_change(20)
 
     # Moving averages
     ma5  = close.rolling(5).mean()
@@ -232,14 +265,17 @@ def _build_features_single(df: pd.DataFrame, spy: pd.DataFrame,
     # Volatility
     _, out["bb_pct"] = _bb(close)
     out["atr_pct"]   = _atr_pct(high, low, close)
+    short_vol = daily_ret.rolling(10).std()
+    long_vol  = daily_ret.rolling(30).std()
+    out["vol_ratio"] = short_vol / long_vol.replace(0, np.nan)
 
     # Volume
     out["volume_ratio"] = volume / volume.rolling(20).mean()
 
     # Lags
-    out["return_lag1"] = out["return_1d"].shift(1)
-    out["return_lag2"] = out["return_1d"].shift(2)
-    out["return_lag3"] = out["return_1d"].shift(3)
+    out["return_lag1"] = daily_ret.shift(1)
+    out["return_lag2"] = daily_ret.shift(2)
+    out["return_lag3"] = daily_ret.shift(3)
     out["rsi_lag1"]    = out["rsi"].shift(1)
 
     # Sentiment
@@ -249,7 +285,10 @@ def _build_features_single(df: pd.DataFrame, spy: pd.DataFrame,
     # SPY + VIX market features
     market = spy.join(vix, how="outer")
     for col in MARKET_FEATURES:
-        out[col] = market[col].reindex(out.index, fill_value=0.0)
+        if col in market.columns:
+            out[col] = market[col].reindex(out.index, fill_value=0.0)
+        else:
+            out[col] = 0.0
 
     # Label
     out["target"] = (close.shift(-1) > close).astype(int)
@@ -440,7 +479,12 @@ def train_model(train: pd.DataFrame, val: pd.DataFrame,
     X_train, y_train = train[ALL_FEATURES], train["target"]
     X_val,   y_val = val[ALL_FEATURES],   val["target"]
 
-    p = {**DEFAULT_PARAMS, **(params or {})}
+    neg = int((y_train == 0).sum())
+    pos = int((y_train == 1).sum())
+    spw = round(neg / pos, 4) if pos > 0 else 1.0
+    print(f"         scale_pos_weight = {spw:.4f}  (neg={neg}, pos={pos})")
+
+    p = {**DEFAULT_PARAMS, "scale_pos_weight": spw, **(params or {})}
     model = xgb.XGBClassifier(**p)
     model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=50)
     print(f"         Best iteration : {model.best_iteration}")
@@ -501,13 +545,16 @@ def finetune_model(base_model_path: str, train: pd.DataFrame, val: pd.DataFrame,
     Continue training from a saved model on the most recent N months of data.
     Pass optimize=True to run Optuna on the recent window before fine-tuning.
     """
-    import glob, os
+    import glob, os, re
     if base_model_path is None:
         candidates = [f for f in glob.glob("xgb_*.json")
                       if f != "xgb_stock_model.json"]
         if not candidates:
             raise FileNotFoundError("No saved model found. Train a model first.")
-        base_model_path = max(candidates, key=os.path.getmtime)
+        def _auc_from_name(p):
+            m = re.search(r"auc([\d.]+)", p)
+            return float(m.group(1)) if m else 0.0
+        base_model_path = max(candidates, key=_auc_from_name)
 
     print(f"\n[Step 4b] Fine-tuning: {base_model_path}")
 
@@ -561,9 +608,9 @@ def finetune_model(base_model_path: str, train: pd.DataFrame, val: pd.DataFrame,
 # ── Step 5: Evaluate ──────────────────────────────────────────────────────────
 
 def _best_threshold(y_true, y_proba) -> float:
-    """Find threshold that maximises balanced accuracy, searching 0.45–0.65."""
+    """Find threshold that maximises balanced accuracy, searching 0.35–0.70."""
     best_t, best_score = 0.5, 0.0
-    for t in np.arange(0.45, 0.66, 0.01):
+    for t in np.arange(0.35, 0.71, 0.01):
         pred        = (y_proba >= t).astype(int)
         n_bull_pred = pred.sum()
         n_bear_pred = len(pred) - n_bull_pred
@@ -732,12 +779,20 @@ def main():
     auc = evaluate(model, test, val=val)
     save_model(model, label, auc)
 
+    # Compare against the best previously saved model (parsed from filename)
+    import glob, re
+    prev_models = [m for m in glob.glob("xgb_*.json") if m != "xgb_stock_model.json"]
+    old_auc = 0.0
+    for m in prev_models:
+        match = re.search(r"auc([\d.]+)", m)
+        if match:
+            old_auc = max(old_auc, float(match.group(1)))
+
     print(f"\n{'=' * 60}")
     print(f"  Training complete.  Test AUC = {auc:.4f}")
-    old_auc = 0.6920
-    diff = auc - old_auc
-    print(
-        f"  vs old model AUC  = {old_auc:.4f}  ({'+' if diff>=0 else ''}{diff:.4f})")
+    if old_auc > 0:
+        diff = auc - old_auc
+        print(f"  vs best saved AUC = {old_auc:.4f}  ({'+' if diff>=0 else ''}{diff:.4f})")
     print("=" * 60)
 
 

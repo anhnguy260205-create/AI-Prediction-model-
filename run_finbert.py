@@ -73,9 +73,9 @@ def score_headlines(pipe, texts: list[str]) -> pd.DataFrame:
 def aggregate_sentiment(df: pd.DataFrame) -> pd.DataFrame:
     """
     Group by date + ticker, compute mean sentiment scores.
-    Returns one row per (date, ticker) with:
-        finbert_score_mean, finbert_pos_mean, finbert_neg_mean,
-        news_count, sentiment_lag1, sentiment_lag2
+    Returns one row per (date, ticker).
+    Lags are NOT computed here — they are computed after merging with the
+    master dataset so that zero-news trading days are correctly counted as 0.
     """
     agg = (
         df.groupby(["date", "ticker"])
@@ -87,11 +87,6 @@ def aggregate_sentiment(df: pd.DataFrame) -> pd.DataFrame:
         )
         .reset_index()
     )
-
-    # Add sentiment lags per ticker
-    agg = agg.sort_values(["ticker", "date"])
-    agg["sentiment_lag1"] = agg.groupby("ticker")["finbert_score_mean"].shift(1)
-    agg["sentiment_lag2"] = agg.groupby("ticker")["finbert_score_mean"].shift(2)
     return agg
 
 
@@ -105,16 +100,27 @@ def merge_into_master(agg: pd.DataFrame) -> pd.DataFrame:
     # Drop old empty sentiment columns from master
     drop_cols = [c for c in master.columns
                  if c in {"finbert_avg_score","gdelt_avg_tone",
-                          "gdelt_avg_tone","av_avg_score",
-                          "av_bullish_ratio","av_bearish_ratio","av_neutral_ratio"}]
+                          "av_avg_score","av_bullish_ratio",
+                          "av_bearish_ratio","av_neutral_ratio",
+                          "sentiment_lag1","sentiment_lag2"}]
     master = master.drop(columns=drop_cols, errors="ignore")
 
     merged = master.merge(agg, on=["date","ticker"], how="left")
 
-    # Fill trading days with no news as zero
-    sent_cols = ["finbert_score_mean","finbert_pos_mean","finbert_neg_mean",
-                 "news_count","sentiment_lag1","sentiment_lag2"]
-    merged[sent_cols] = merged[sent_cols].fillna(0.0)
+    # Fill trading days with no news as zero BEFORE computing lags,
+    # so zero-news days contribute 0 to the lag (not a skip).
+    base_sent_cols = ["finbert_score_mean","finbert_pos_mean",
+                      "finbert_neg_mean","news_count"]
+    merged[base_sent_cols] = merged[base_sent_cols].fillna(0.0)
+
+    # Compute lags over the full trading-day calendar (zeros included)
+    merged = merged.sort_values(["ticker", "date"])
+    merged["sentiment_lag1"] = (
+        merged.groupby("ticker")["finbert_score_mean"].shift(1).fillna(0.0)
+    )
+    merged["sentiment_lag2"] = (
+        merged.groupby("ticker")["finbert_score_mean"].shift(2).fillna(0.0)
+    )
 
     filled = (merged["finbert_score_mean"] != 0).sum()
     total  = len(merged)
