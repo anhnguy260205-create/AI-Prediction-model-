@@ -47,7 +47,7 @@ TIINGO_API_KEY    = os.getenv("TIINGO_API_KEY",     "YOUR_TIINGO_KEY")
 ALL_TICKERS = ["AAPL", "AMD", "AMZN", "AVGO", "GOOGL",
                "META", "MSFT", "NVDA", "ORCL", "TSLA"]
 START_DATE  = "2021-01-01"
-END_DATE    = "2026-06-30"
+END_DATE    = "2026-07-01"
 OUTPUT_FILE = Path("all_news_collected.csv")
 CACHE_DIR   = Path("news_collected")
 CACHE_DIR.mkdir(exist_ok=True)
